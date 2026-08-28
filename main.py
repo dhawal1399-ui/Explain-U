@@ -1,30 +1,51 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from pypdf import PdfReader
 import io
 from sentence_transformers import SentenceTransformer
 import chromadb
 import ollama
-
+from pydantic import BaseModel
 
 app = FastAPI()
+
+class ChatRequest(BaseModel):
+    question: str
+    session_id: str
+
+conversation_history = {}
+
 
 @app.get("/")
 def read_root():
     return 'Hello world'
 
 @app.post("/upload")
-async def upload_file(file : UploadFile = File(...)):
+async def upload_file(
+
+    file : UploadFile = File(...),
+    question: str = Form(...),
+    session_id: str = Form(...)
+
+    ):
+
+    if session_id not in conversation_history:
+        conversation_history[session_id] = []
+
+    history = conversation_history[session_id]
+
     file_content = await file.read()
     reader = PdfReader(io.BytesIO(file_content))
     text = ""
     for page in reader.pages:
         text += page.extract_text() or ""
 
-    chunks = chunk_text(text, 100, 20)
+    chunks = chunk_text(text, 500, 100)
     model = SentenceTransformer("all-MiniLM-L6-v2")
     vectors = model.encode(chunks)
     client = chromadb.Client()
+
     collection = client.get_or_create_collection(name="documents")
+
 
     collection.add(
         ids = [str(i) for i in range(len(chunks))],
@@ -32,8 +53,13 @@ async def upload_file(file : UploadFile = File(...)):
         embeddings=vectors
     )
 
+    final_quest = rewrite_query(question, history)
+    print("\n========== QUERY REWRITING ==========")
+    print("Original Query:", question)
+    print("Rewritten Query:", final_quest)
+    print("=====================================")
     result = collection.query(
-        query_texts=["What is the candidate full name?"],
+        query_texts=[final_quest],
         n_results=3
     )
 
@@ -47,10 +73,9 @@ async def upload_file(file : UploadFile = File(...)):
 
     context = "\n---CHUNK---\n".join(docs)
 
-    print("context:",context)
     response = ollama.chat(
             model="llama3.2",
-            messages=[
+            messages=history + [
                 {
                     "role": "user",
                     "content": f"""
@@ -62,14 +87,30 @@ async def upload_file(file : UploadFile = File(...)):
         {context}
 
         Question:
-        What is the candidate's full name?
+        {question}
 
-        The candidate's full name is explicitly shown at the beginning of the context.
-        Return only the full name.
+        Answer the user's question based only on the provided context and conversation history.
+
+        If the answer is not available in the provided context, say that you could not find the answer.
+        Do not make up information.
         """
                 }
             ]
         )
+
+    history.append({
+        "role": "user",
+        "content":question
+    })
+    
+    history.append({
+        "role": "assistant",
+        "content": response["message"]["content"]
+    })
+
+    print("\n========== HISTORY AFTER RESPONSE ==========")
+    print(history)
+    print("============================================")
 
     return {
         "filename":file.filename,
@@ -80,6 +121,42 @@ async def upload_file(file : UploadFile = File(...)):
     }
 
 
+def rewrite_query(question, history):
+
+    history_text = "\n".join(
+        f"{message['role']}: {message['content']}"
+        for message in history
+    )
+
+    prompt = f"""
+You are a query rewriting assistant.
+
+Given the conversation history and the user's current question,
+rewrite the current question into a standalone question.
+
+Rules:
+- Use the conversation history to resolve references like "he", "his", "it", "they", etc.
+- Do not answer the question.
+- Return ONLY the rewritten question.
+
+Conversation History:
+{history_text}
+
+Current Question:
+{question}
+"""
+
+    response = ollama.chat(
+        model="llama3.2",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+
+    return response["message"]["content"]
 
 def chunk_text(text, chunk_size = 100, overlap = 20):
     chunks = []
@@ -93,9 +170,4 @@ def chunk_text(text, chunk_size = 100, overlap = 20):
         start = end - overlap
 
     return chunks
-
-
-
-
-
 
