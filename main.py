@@ -1,12 +1,15 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from pypdf import PdfReader
 import io
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import chromadb
 import ollama
 from pydantic import BaseModel
+from rank_bm25 import BM25Okapi
 
 app = FastAPI()
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 class ChatRequest(BaseModel):
     question: str
@@ -40,6 +43,10 @@ async def upload_file(
         text += page.extract_text() or ""
 
     chunks = chunk_text(text, 500, 100)
+
+    tokenized_chunks = [chunk.split() for chunk in chunks]
+
+    bm25 = BM25Okapi(tokenized_chunks) 
     model = SentenceTransformer("all-MiniLM-L6-v2")
     vectors = model.encode(chunks)
     client = chromadb.Client()
@@ -54,24 +61,68 @@ async def upload_file(
     )
 
     final_quest = rewrite_query(question, history)
-    print("\n========== QUERY REWRITING ==========")
-    print("Original Query:", question)
-    print("Rewritten Query:", final_quest)
-    print("=====================================")
+    # print("\n========== QUERY REWRITING ==========")
+    # print("Original Query:", question)
+    # print("Rewritten Query:", final_quest)
+    # print("=====================================")
     result = collection.query(
         query_texts=[final_quest],
-        n_results=3
+        n_results=10
     )
 
     docs = result["documents"][0]
 
-    print("DOC COUNT:", len(docs))
+    tokenized_query = final_quest.split()
 
-    for i, doc in enumerate(docs):
-        print(f"\n--- DOC {i} ---")
+    bm25_scores = bm25.get_scores(tokenized_query)
+
+    top_bm25_indexes = bm25_scores.argsort()[-5:][::-1]
+
+    bm25_docs = [chunks[i] for i in top_bm25_indexes]
+
+    print("\n========== BM25 TOP RESULTS ==========")
+
+    for i, doc in enumerate(bm25_docs):
+        print(f"\n--- BM25 DOC {i} ---")
         print(doc)
 
-    context = "\n---CHUNK---\n".join(docs)
+    print("======================================")
+
+    combined_docs = list(dict.fromkeys(docs + bm25_docs))
+
+    print("\n========== CHROMA TOP RESULTS ==========")
+
+    for i, doc in enumerate(combined_docs):
+        print(f"\n--- CHROMA DOC {i} ---")
+        print(doc)
+
+    print("========================================")
+    pairs = [[final_quest, doc] for doc in combined_docs]
+
+    scores = reranker.predict(pairs)
+
+    for i, score in enumerate(scores):
+        print(f"Chunk {i} Score: {score}")
+
+    ranked_docs = sorted(
+        zip(scores, combined_docs),
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    
+
+    top_docs = [doc for score, doc in ranked_docs[:8]]
+
+    context = "\n---CHUNK---\n".join(top_docs)
+
+    print("\n========== RERANKED TOP 5 ==========")
+
+    for i, doc in enumerate(top_docs):
+        print(f"\n--- TOP DOC {i} ---")
+        print(doc)
+
+    print("====================================")
 
     response = ollama.chat(
             model="llama3.2",
